@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# v9-совместимость: wclog {status|live|dns|stations|leases|iocs|stop-sniff}
+set -euo pipefail
+
+WLAB_BIN=/usr/bin/wlab
+[[ -x "$WLAB_BIN" ]] || WLAB_BIN=/usr/local/bin/wlab
+
+CONF=/etc/wlab/wlab.conf
+IFACE_AP=wlan0
+# shellcheck disable=SC1090
+[[ -r "$CONF" ]] && source "$CONF"
+LOG_DIR="/var/log/wlab/ap"
+DNS_LOG="$LOG_DIR/dns.log"
+
+case "${1:-}" in
+  status)
+    exec "$WLAB_BIN" status
+    ;;
+  live)
+    echo "=== LIVE DNS (Ctrl+C — выход) ==="
+    tail -f "$DNS_LOG" 2>/dev/null | grep -E "query\[A\]|query\[AAAA\]" || true
+    ;;
+  dns)
+    echo "=== ВСЕ DNS ==="
+    tail -f "$DNS_LOG" 2>/dev/null || true
+    ;;
+  stations)
+    echo "=== КЛИЕНТЫ ==="
+    watch -n 1 "iw dev $IFACE_AP station dump | grep -E 'Station|signal|inactive'"
+    ;;
+  leases)
+    echo "=== ВЫДАННЫЕ IP ==="
+    cat /var/lib/misc/dnsmasq.leases 2>/dev/null \
+      || cat /tmp/dnsmasq.leases 2>/dev/null \
+      || echo "файл лизов не найден (точка не поднималась?)"
+    ;;
+  iocs)
+    echo "=== ПОДОЗРИТЕЛЬНЫЕ ДОМЕНЫ ==="
+    grep -Ei "malware|phish|track|telemetry|beacon" "$DNS_LOG" 2>/dev/null | tail -n 20 || true
+    ;;
+  stop-sniff)
+    pkill tcpdump 2>/dev/null || true
+    echo "[+] сниффинг остановлен, точка жива"
+    ;;
+  *)
+    echo "Использование: wclog {status|live|dns|stations|leases|iocs|stop-sniff}"
+    exit 1
+    ;;
+esac

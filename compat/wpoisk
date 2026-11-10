@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# v9-совместимость: wpoisk — один снимок, показать сети и клиентов
+set -euo pipefail
+WLAB_BIN=/usr/bin/wlab
+[[ -x "$WLAB_BIN" ]] || WLAB_BIN=/usr/local/bin/wlab
+exec "$WLAB_BIN" scan -1 "$@"

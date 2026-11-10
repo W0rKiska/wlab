@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  wlab osint — разведка по домену
+#  wlab osint example.com            whois, dns, поддомены, заголовки, быстрый nmap
+#  wlab osint example.com --full     все 65535 портов + vuln-скрипты
+#  wlab osint example.com --ports 22,80,443
+#  wlab osint example.com --no-nmap  только пассивка
+#
+#  Отчёт (markdown): /var/log/wlab/osint/<домен>_<дата>.md
+# ============================================================================
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+export WLAB_ROOT="${WLAB_ROOT:-$(dirname "$(dirname "$SELF")")}"
+# shellcheck source=/dev/null
+source "$WLAB_ROOT/lib/wlab_lib.sh"
+wlab_load_conf
+wlab_need_root "$SELF" "$@"
+wlab_dirs
+
+DOMAIN=""
+PORTS=""
+FULL=0
+NO_NMAP=0
+NO_NIKTO=0
+
+usage() {
+  cat <<EOF
+Использование: wlab osint <домен> [опции]
+
+  --full          полный скан всех портов
+  --ports LIST    свои порты (22,80,443)
+  --no-nmap       без активного сканирования
+  --no-nikto      без nikto
+  -h, --help      эта справка
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --full)     FULL=1; shift ;;
+    --ports)    PORTS="${2:?нет значения для $1}"; shift 2 ;;
+    --no-nmap)  NO_NMAP=1; shift ;;
+    --no-nikto) NO_NIKTO=1; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    -*)         wlab_die "неизвестная опция: $1" ;;
+    *)
+      [[ -n "$DOMAIN" ]] && wlab_die "лишний аргумент: $1"
+      DOMAIN="$1"; shift ;;
+  esac
+done
+
+[[ -n "$DOMAIN" ]] || { usage; exit 1; }
+
+CLEAN=$(printf '%s' "$DOMAIN" | sed -e 's|^[A-Za-z][A-Za-z0-9+.-]*://||' -e 's|/.*$||' -e 's|:.*$||')
+[[ "$CLEAN" =~ ^[A-Za-z0-9.-]+$ ]] || wlab_die "это не домен: $DOMAIN"
+
+REPORT_DIR="$WLAB_STATE/osint"
+REPORT="$REPORT_DIR/${CLEAN}_$(date +%Y%m%d_%H%M%S).md"
+
+log() {
+  local s
+  s=$(printf '%b' "$1")
+  printf '%s\n' "$s"
+  printf '%s\n' "$s" | sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' >> "$REPORT"
+}
+
+h() {
+  log ""
+  log "${C_CYN}## $1${C_R}"
+}
+
+wlab_require_cmds whois dig curl || exit 1
+
+log "# OSINT: \`$CLEAN\`"
+log ""
+log "- дата: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+log "- хост: $(hostname)"
+log "- инструмент: wlab ${WLAB_VERSION}"
+
+# ---------------------------------------------------------------------------
+h "1. WHOIS"
+WHOIS_DATA=$(timeout 15 whois "$CLEAN" 2>/dev/null \
+  | grep -Ei '^\s*(Registrar:|Creation Date:|Registry Expiry Date:|Updated Date:|Name Server:)' \
+  | sort -u | head -n 15 || true)
+if [[ -n "$WHOIS_DATA" ]]; then
+  while IFS= read -r line; do log "    $line"; done <<< "$WHOIS_DATA"
+else
+  log "    WHOIS недоступен"
+fi
+
+# ---------------------------------------------------------------------------
+h "2. DNS"
+IPV4=$(dig +short +time=3 +tries=1 A "$CLEAN" 2>/dev/null | head -n 1 || true)
+IPV6=$(dig +short +time=3 +tries=1 AAAA "$CLEAN" 2>/dev/null | head -n 1 || true)
+NS=$(dig +short +time=3 +tries=1 NS "$CLEAN" 2>/dev/null | tr '\n' ' ' || true)
+MX=$(dig +short +time=3 +tries=1 MX "$CLEAN" 2>/dev/null | tr '\n' ' ' || true)
+
+log "    IPv4: ${IPV4:-нет}"
+[[ -n "$IPV6" ]] && log "    IPv6: $IPV6"
+log "    NS:   ${NS:-нет}"
+log "    MX:   ${MX:-нет}"
+
+# 198.18.0.0/15 — диапазон, которым VPN/NAT перехватывает DNS.
+# Скан по такому IP бьёт в локальный прокси, который отвечает "open" на всё.
+SCAN_TARGET="$CLEAN"
+FAKE_IP=0
+if [[ "$IPV4" == 198.18.* || "$IPV4" == 198.19.* ]]; then
+  FAKE_IP=1
+  log "${C_YEL}    [!] 198.18.x.x — DNS-перехват (VPN или NAT VirtualBox).${C_R}"
+  log "    ищу реальный IP через публичные резолверы..."
+  REAL_IP=""
+  for r in 1.1.1.1 8.8.8.8 9.9.9.9; do
+    REAL_IP=$(dig +short +time=2 +tries=1 @"$r" A "$CLEAN" 2>/dev/null \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+    [[ -n "$REAL_IP" ]] && break
+  done
+  if [[ -n "$REAL_IP" && "$REAL_IP" != "$IPV4" ]]; then
+    log "    реальный IP: ${C_GRN}$REAL_IP${C_R}"
+    SCAN_TARGET="$REAL_IP"
+  else
+    log "    ${C_RED}реальный IP не получен — активный скан будет пропущен${C_R}"
+  fi
+fi
+
+log "    TXT (SPF/DMARC/верификация):"
+DNS_TXT=$(dig +short +time=3 +tries=1 TXT "$CLEAN" 2>/dev/null | head -n 8 || true)
+if [[ -n "$DNS_TXT" ]]; then
+  while IFS= read -r line; do log "      $line"; done <<< "$DNS_TXT"
+else
+  log "      нет"
+fi
+
+DMARC=$(dig +short +time=3 +tries=1 TXT "_dmarc.$CLEAN" 2>/dev/null | head -n 1 || true)
+log "    _dmarc: ${DMARC:-${C_RED}ОТСУТСТВУЕТ${C_R}}"
+
+# ---------------------------------------------------------------------------
+h "3. ПОДДОМЕНЫ (crt.sh)"
+CRT=$(timeout 25 curl -s --max-time 20 "https://crt.sh/?q=%25.${CLEAN}&output=json" 2>/dev/null || true)
+if [[ -n "$CRT" ]]; then
+  if command -v jq >/dev/null 2>&1; then
+    SUBS=$(printf '%s' "$CRT" | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | sort -u | head -n 25 || true)
+  else
+    SUBS=$(printf '%s' "$CRT" | grep -o '"name_value":"[^"]*"' | cut -d'"' -f4 | sed 's/\*\.//g' | sort -u | head -n 25 || true)
+  fi
+else
+  SUBS=""
+fi
+if [[ -n "$SUBS" ]]; then
+  while IFS= read -r line; do log "    $line"; done <<< "$SUBS"
+else
+  log "    crt.sh молчит (или домен без сертификатов)"
+fi
+
+# ---------------------------------------------------------------------------
+h "4. ТЕХНОЛОГИИ / WAF / ЗАГОЛОВКИ"
+if command -v wafw00f >/dev/null 2>&1; then
+  WAF=$(timeout 25 wafw00f -a "https://$CLEAN" 2>/dev/null | grep -i 'is behind' | head -n 1 || true)
+  log "    WAF: ${WAF:-не обнаружен}"
+else
+  log "    WAF: wafw00f не установлен"
+fi
+
+if command -v whatweb >/dev/null 2>&1; then
+  WW=$(timeout 25 whatweb -a 1 --no-errors "https://$CLEAN" 2>/dev/null | head -n 1 || true)
+  log "    WhatWeb: ${WW:-нет ответа}"
+fi
+
+HEADERS=$(curl -sI -m 8 -k "https://$CLEAN" 2>/dev/null || true)
+if [[ -n "$HEADERS" ]]; then
+  for pair in "strict-transport-security:HSTS" "content-security-policy:CSP" \
+              "x-frame-options:X-Frame-Options" "x-content-type-options:X-Content-Type"; do
+    key=${pair%%:*}
+    label=${pair#*:}
+    val=$(printf '%s' "$HEADERS" | grep -i "^${key}:" | head -n 1 || true)
+    if [[ -n "$val" ]]; then
+      log "    $label: $val"
+    else
+      log "    $label: ${C_YEL}ОТСУТСТВУЕТ${C_R}"
+    fi
+  done
+else
+  log "    HTTPS не отвечает"
+fi
+
+# ---------------------------------------------------------------------------
+h "5. АРХИВЫ (Wayback)"
+WB=$(timeout 15 curl -s --max-time 12 "http://archive.org/wayback/available?url=${CLEAN}" 2>/dev/null || true)
+if command -v jq >/dev/null 2>&1; then
+  WB_URL=$(printf '%s' "$WB" | jq -r '.archived_snapshots.closest.url // empty' 2>/dev/null || true)
+else
+  WB_URL=$(printf '%s' "$WB" | grep -o '"url":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
+fi
+log "    ${WB_URL:-снимков нет}"
+
+# ---------------------------------------------------------------------------
+h "6. ПОРТЫ (nmap)"
+OPEN_PORTS=""
+if [[ $NO_NMAP -eq 0 ]]; then
+  if [[ $FAKE_IP -eq 1 && "$SCAN_TARGET" == "$CLEAN" ]]; then
+    log "    ${C_YEL}пропущено: DNS отдаёт заглушку, сканировать нечего${C_R}"
+    log "    выключи VPN или задай --no-nmap"
+  elif ! command -v nmap >/dev/null 2>&1; then
+    log "    nmap не установлен"
+  else
+    NMAP_OUT="$REPORT_DIR/.nmap_${CLEAN}.txt"
+    VULN_OUT=""
+    NARGS=(-T4 -Pn --max-retries 2)
+    if [[ -n "$PORTS" ]]; then
+      NARGS+=(-p "$PORTS")
+      log "    скан портов: $PORTS"
+    elif [[ $FULL -eq 1 ]]; then
+      NARGS+=(-p-)
+      log "    полный скан 65535 портов (долго)"
+    else
+      NARGS+=(-F)
+      log "    быстрый скан топ-100"
+    fi
+
+    nmap "${NARGS[@]}" "$SCAN_TARGET" -oN "$NMAP_OUT" >/dev/null 2>&1 || true
+    OPEN_PORTS=$(grep -E '^[0-9]+/tcp\s+open' "$NMAP_OUT" 2>/dev/null | awk '{print $1}' | cut -d'/' -f1 | paste -sd, - || true)
+
+    if [[ -n "$OPEN_PORTS" ]]; then
+      port_cnt=$(tr ',' '\n' <<< "$OPEN_PORTS" | wc -l)
+      if (( port_cnt > 50 )); then
+        log "    ${C_YEL}[!] $port_cnt открытых портов — так не бывает на реальном хосте.${C_R}"
+        log "    ${C_YEL}    Это прокси/VPN-перехват. Результату не верю.${C_R}"
+      fi
+    fi
+
+    if [[ -z "$OPEN_PORTS" ]]; then
+      log "    открытых портов нет"
+    else
+      log "    ${C_GRN}открыто: $OPEN_PORTS${C_R}"
+      grep -E '^[0-9]+/tcp\s+open' "$NMAP_OUT" | while IFS= read -r line; do log "    $line"; done
+
+      VULN_OUT="$REPORT_DIR/.nmap_vuln_${CLEAN}.txt"
+      log "    версии + vuln-скрипты..."
+      nmap -p "$OPEN_PORTS" -sV -T4 -Pn --script vuln --script-timeout 60s \
+           "$SCAN_TARGET" -oN "$VULN_OUT" >/dev/null 2>&1 || true
+
+      VULNS=$(grep -E 'VULNERABLE|CVE-[0-9]{4}-[0-9]+' "$VULN_OUT" 2>/dev/null | head -n 12 || true)
+      if [[ -n "$VULNS" ]]; then
+        while IFS= read -r line; do log "    ${C_YEL}$line${C_R}"; done <<< "$VULNS"
+      else
+        log "    явных уязвимостей по версиям не найдено"
+      fi
+    fi
+    rm -f "$NMAP_OUT" "$VULN_OUT"
+  fi
+else
+  log "    пропущено (--no-nmap)"
+fi
+
+# ---------------------------------------------------------------------------
+if [[ $NO_NIKTO -eq 0 ]] && command -v nikto >/dev/null 2>&1; then
+  h "7. NIKTO"
+  NIK=$(timeout 90 nikto -h "https://$CLEAN" -Tuning 123bc -nointeractive 2>/dev/null | grep -E '^\+ ' | head -n 10 || true)
+  if [[ -n "$NIK" ]]; then
+    while IFS= read -r line; do log "    $line"; done <<< "$NIK"
+  else
+    log "    ничего явного"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+log ""
+log "---"
+log "готово. отчёт: \`$REPORT\`"
+
+# отдаём отчёт пользователю, а не root'у
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+  chown -R "$SUDO_USER" "$REPORT_DIR" 2>/dev/null || true
+fi
+
+wlab_log osint done "domain=$CLEAN" "report=$REPORT" "ports=${OPEN_PORTS:-none}"
+echo
+wlab_ok "отчёт: $REPORT"

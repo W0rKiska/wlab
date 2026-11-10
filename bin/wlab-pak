@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  wlab pak — разбор BLE-пакета из последней сессии
+#  wlab pak 1234
+#  wlab pak --list
+# ============================================================================
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+export WLAB_ROOT="${WLAB_ROOT:-$(dirname "$(dirname "$SELF")")}"
+# shellcheck source=/dev/null
+source "$WLAB_ROOT/lib/wlab_lib.sh"
+wlab_load_conf
+
+command -v python3 >/dev/null 2>&1 || wlab_die "нужен python3"
+
+exec python3 "$WLAB_ROOT/lib/packet_show.py" "$@"

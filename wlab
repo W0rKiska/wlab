@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  WLAB :: единая точка входа
+#  wlab              — интерактивное меню (как раньше)
+#  wlab <команда>    — напрямую
+# ============================================================================
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+WLAB_ROOT=$(dirname "$SELF")
+export WLAB_ROOT
+
+# shellcheck source=/dev/null
+source "$WLAB_ROOT/lib/wlab_lib.sh"
+wlab_load_conf
+
+usage() {
+  wlab_logo
+  cat <<EOF
+${C_CYN}WLAB v${WLAB_VERSION}${C_R} — лабораторный набор для Wi-Fi / BLE / OSINT
+${C_DIM}автор: @w0rkil0m · t.me/w0rkil0m${C_R}
+
+${C_B}ЦЕЛЬ${C_R}
+  wlab ap [--mode N]          поднять точку (evil twin / karma / wpe)
+  wlab scan [-c CH] [-1]      live-скан эфира + клиенты
+  wlab deauth -b BSSID [...]  деаут / снос клиента / ловля хендшейка
+  wlab pmkid [-d SEC]         PMKID-захват без клиента и без деаута
+  wlab ble [фильтр]           live-монитор BLE (nRF52840)
+  wlab pak N                  разбор пакета N из последней сессии
+  wlab osint domain.com       whois / dns / поддомены / порты / cve
+
+${C_B}СЛУЖЕБНОЕ${C_R}
+  wlab status                 состояние адаптеров и процессов
+  wlab anon                   рандомить MAC
+  wlab stop [--purge]         погасить всё и вернуть сеть
+  wlab version                версия
+
+${C_B}СТАРЫЕ КОМАНДЫ${C_R} (работают как раньше)
+  wcop  Wscan  Wdeaut  Watak  wtaak  wpoisk  bscan  bpak  sscan  wclog  stop
+
+${C_DIM}Без аргументов — меню. Конфиг: ${WLAB_CONF}${C_R}
+EOF
+}
+
+do_status() {
+  wlab_banner "WLAB :: статус"
+  for i in "$IFACE_MON" "$IFACE_AP"; do
+    if wlab_iface_exists "$i"; then
+      t=$(wlab_iface_type "$i")
+      s=$(cat "/sys/class/net/${i}/operstate" 2>/dev/null || echo '?')
+      m=$(cat "/sys/class/net/${i}/address" 2>/dev/null || echo '?')
+      printf '  %-8s type=%-8s state=%-6s mac=%s\n' "$i" "${t:-?}" "$s" "$m"
+    else
+      printf '  %-8s %sНЕ НАЙДЕН%s\n' "$i" "$C_RED" "$C_R"
+    fi
+  done
+  echo
+  if ls "$WLAB_RUN"/*.pid >/dev/null 2>&1; then
+    wlab_info "живые процессы:"
+    for f in "$WLAB_RUN"/*.pid; do
+      n=$(basename "$f" .pid)
+      p=$(cat "$f" 2>/dev/null || true)
+      if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
+        printf '  %-12s pid=%s\n' "$n" "$p"
+      fi
+    done
+  else
+    wlab_info "процессов wlab не запущено"
+  fi
+  echo
+  wlab_info "логи: $WLAB_STATE"
+  du -sh "$WLAB_STATE" 2>/dev/null || true
+}
+
+menu_deauth() {
+  local capture=$1 b ch t
+  printf 'BSSID точки: '
+  read -r b < /dev/tty || return 0
+  printf 'Канал: '
+  read -r ch < /dev/tty || return 0
+  printf 'MAC клиента (Enter = вся сеть): '
+  read -r t < /dev/tty || return 0
+
+  [[ "$b" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || { wlab_err "BSSID кривой"; return 0; }
+  [[ "$ch" =~ ^[0-9]+$ ]] || { wlab_err "канал числом"; return 0; }
+
+  local a=(-b "$b" -c "$ch")
+  [[ -n "$t" ]] && a+=(-t "$t")
+
+  if [[ $capture -eq 1 ]]; then
+    "$WLAB_ROOT/bin/wlab-deauth" "${a[@]}" -w
+  else
+    "$WLAB_ROOT/bin/wlab-deauth" "${a[@]}"
+  fi
+}
+
+interactive_menu() {
+  while true; do
+    printf '\033[H\033[2J'
+    wlab_logo
+    cat <<EOF
+  ${C_B}1${C_R}  Сканировать эфир         ${C_DIM}сети и клиенты${C_R}
+  ${C_B}2${C_R}  Поднять точку            ${C_DIM}обычная / evil twin / karma / wpe${C_R}
+  ${C_B}3${C_R}  Деаут / снести клиента   ${C_DIM}нужен BSSID и канал${C_R}
+  ${C_B}4${C_R}  Поймать хендшейк         ${C_DIM}деаут + запись в .cap${C_R}
+  ${C_B}5${C_R}  PMKID                    ${C_DIM}без клиента, 60 сек${C_R}
+  ${C_B}6${C_R}  BLE-монитор              ${C_DIM}nRF52840${C_R}
+  ${C_B}7${C_R}  OSINT по домену
+  ${C_B}8${C_R}  Статус адаптеров
+  ${C_B}9${C_R}  Остановить всё
+  ${C_B}0${C_R}  Выход
+EOF
+    printf '\nВыбор: '
+    read -r c < /dev/tty || return 0
+
+    case "$c" in
+      1) "$WLAB_ROOT/bin/wlab-scan" ;;
+      2) python3 "$WLAB_ROOT/bin/wlab_ap.py" ;;
+      3) menu_deauth 0 ;;
+      4) menu_deauth 1 ;;
+      5) "$WLAB_ROOT/bin/wlab-pmkid" -d 60 ;;
+      6) "$WLAB_ROOT/bin/wlab-ble" ;;
+      7) printf 'Домен: '; read -r d < /dev/tty || continue
+         [[ -n "$d" ]] && "$WLAB_ROOT/bin/wlab-osint" "$d" ;;
+      8) do_status ;;
+      9) "$WLAB_ROOT/bin/wlab-stop" ;;
+      0|q|Q) exit 0 ;;
+      *) wlab_warn "нет такого пункта: $c"; sleep 1; continue ;;
+    esac
+
+    printf '\n%s[Enter] — назад в меню%s' "$C_DIM" "$C_R"
+    read -r _ < /dev/tty || true
+  done
+}
+
+cmd=${1:-}
+
+if [[ -z "$cmd" ]]; then
+  if [[ -t 0 && -t 1 ]]; then
+    interactive_menu
+    exit 0
+  fi
+  usage
+  exit 0
+fi
+
+shift
+
+case "$cmd" in
+  ap|wcop)      exec python3 "$WLAB_ROOT/bin/wlab_ap.py" "$@" ;;
+  scan|Wscan)   exec "$WLAB_ROOT/bin/wlab-scan" "$@" ;;
+  deauth|deaut) exec "$WLAB_ROOT/bin/wlab-deauth" "$@" ;;
+  pmkid)        exec "$WLAB_ROOT/bin/wlab-pmkid" "$@" ;;
+  ble|bscan)    exec "$WLAB_ROOT/bin/wlab-ble" "$@" ;;
+  pak|bpak)     exec "$WLAB_ROOT/bin/wlab-pak" "$@" ;;
+  osint|sscan)  exec "$WLAB_ROOT/bin/wlab-osint" "$@" ;;
+  stop|kill)    exec "$WLAB_ROOT/bin/wlab-stop" "$@" ;;
+  anon)
+    wlab_need_root "$SELF" anon "$@"
+    wlab_banner "WLAB :: анонимизация"
+    for i in "$IFACE_MON" "$IFACE_AP"; do
+      if wlab_iface_exists "$i"; then
+        m=$(wlab_random_mac "$i")
+        wlab_ok "$i -> $m"
+      else
+        wlab_warn "$i не найден, пропускаю"
+      fi
+    done
+    ;;
+  status)   do_status ;;
+  version|-v|--version)
+    wlab_logo
+    echo "wlab ${WLAB_VERSION} — by @w0rkil0m (t.me/w0rkil0m)"
+    ;;
+  help|-h|--help) usage ;;
+  *)
+    wlab_err "не знаю команду '$cmd'"
+    usage
+    exit 1
+    ;;
+esac

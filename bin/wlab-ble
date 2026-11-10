@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  wlab ble — live-монитор BLE через nRF52840
+#
+#  wlab ble                   все пакеты
+#  wlab ble AA:BB:CC:DD:EE:FF конкретное устройство
+#  wlab ble ADV_IND           только реклама
+#  wlab ble CONNECT           только подключения
+#
+#  Данные пишутся в /var/log/wlab/ble.jsonl, разбор: wlab pak <номер>
+# ============================================================================
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+export WLAB_ROOT="${WLAB_ROOT:-$(dirname "$(dirname "$SELF")")}"
+# shellcheck source=/dev/null
+source "$WLAB_ROOT/lib/wlab_lib.sh"
+wlab_load_conf
+wlab_need_root "$SELF" "$@"
+wlab_dirs
+
+FILTER=""
+DURATION=0
+IFC=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--duration) DURATION="${2:?нет значения для $1}"; shift 2 ;;
+    -i|--iface)    IFC="${2:?нет значения для $1}"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+Использование: wlab ble [фильтр] [опции]
+
+  фильтр          MAC | ADV_IND | SCAN_REQ | CONNECT | (пусто = всё)
+  -d, --duration  сколько секунд слушать (0 = до Ctrl+C)
+  -i, --iface     имя/индекс интерфейса tshark
+EOF
+      exit 0 ;;
+    -*) wlab_die "неизвестная опция: $1" ;;
+    *)
+      [[ -n "$FILTER" ]] && wlab_die "лишний аргумент: $1"
+      FILTER="$1"
+      shift ;;
+  esac
+done
+
+wlab_uint "$DURATION" || wlab_die "duration должен быть числом"
+
+wlab_require_cmds tshark || { wlab_info "sudo apt install -y tshark"; exit 1; }
+
+# --- найти сниффер ----------------------------------------------------------
+# ВАЖНО: tshark НЕ принимает /dev/ttyACM0 как интерфейс.
+# nRF Sniffer — это extcap, у него свой номер в `tshark -D`.
+resolve_ble_iface() {
+  local d
+  d=$(tshark -D 2>/dev/null | grep -i 'nRF Sniffer' | head -1 || true)
+  if [[ -z "$d" ]]; then
+    d=$(tshark -D 2>/dev/null | grep -iE 'nrf|nordic' | head -1 || true)
+  fi
+  [[ -n "$d" ]] || return 1
+  printf '%s' "$d" | awk '{print $1}' | tr -d '.'
+  return 0
+}
+
+if [[ -z "$IFC" ]]; then
+  if [[ -n "${WLAB_BLE:-}" ]]; then
+    IFC="$WLAB_BLE"
+  else
+    IFC=$(resolve_ble_iface || true)
+  fi
+fi
+
+if [[ -z "$IFC" ]]; then
+  wlab_err "nRF Sniffer не найден в tshark -D"
+  wlab_info "проверь: tshark -D 2>&1 | grep -i nrf"
+  wlab_info "нужен плагин nRF Sniffer + прошивка донгла"
+  wlab_info "если донгл виден как $IFACE_BLE — проблема в плагине, а не в железе"
+  exit 1
+fi
+wlab_ok "интерфейс: $IFC"
+
+# --- какие поля вообще есть в этой версии tshark ----------------------------
+ALL_AVAIL=$(tshark -G fields 2>/dev/null | awk -F'\t' '$1=="F" {print $3}' || true)
+
+WANT=(
+  frame.number
+  frame.time_relative
+  btle.advertising_header.pdu_type
+  btle.advertising_address
+  btle.initiator_address
+  btle.scanning_address
+  btle.advertising_data
+  btcommon.eir_ad.entry.device_name
+  btcommon.eir_ad.entry.manufacturer_data
+  btcommon.eir_ad.entry.tx_power_level
+  btcommon.eir_ad.entry.uuid_16
+  nordic_ble.rssi
+  btle.rssi
+)
+
+FIELDS=()
+E_ARGS=()
+for f in "${WANT[@]}"; do
+  # сравнение через pattern-match, а не grep -q: под pipefail pipe в SIGPIPE
+  if [[ $'\n'"$ALL_AVAIL"$'\n' == *$'\n'"$f"$'\n'* ]]; then
+    FIELDS+=("$f")
+    E_ARGS+=(-e "$f")
+  fi
+done
+
+if (( ${#FIELDS[@]} == 0 )); then
+  wlab_err "tshark не знает ни одного btle-поля. Плагин не загружен?"
+  exit 1
+fi
+wlab_dbg "поля: ${FIELDS[*]}"
+
+declare -A POS=()
+for i in "${!FIELDS[@]}"; do POS["${FIELDS[$i]}"]=$i; done
+
+# --- фильтр -----------------------------------------------------------------
+DFILTER="btle"
+DESC="ВСЁ"
+if [[ "$FILTER" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+  DFILTER="btle.advertising_address == $FILTER || btle.initiator_address == $FILTER || btle.scanning_address == $FILTER"
+  DESC="$FILTER"
+else
+  case "$FILTER" in
+    ADV_IND)   DFILTER="btle.advertising_header.pdu_type == 0x00"; DESC="ADV_IND" ;;
+    ADV_DIRECT) DFILTER="btle.advertising_header.pdu_type == 0x01"; DESC="ADV_DIRECT" ;;
+    ADV_NONCONN) DFILTER="btle.advertising_header.pdu_type == 0x02"; DESC="ADV_NONCONN" ;;
+    SCAN_REQ)  DFILTER="btle.advertising_header.pdu_type == 0x03"; DESC="SCAN_REQ" ;;
+    SCAN_RSP)  DFILTER="btle.advertising_header.pdu_type == 0x04"; DESC="SCAN_RSP" ;;
+    CONNECT)   DFILTER="btle.advertising_header.pdu_type == 0x05"; DESC="CONNECT" ;;
+    "")        : ;;
+    *)         wlab_die "непонятный фильтр: $FILTER" ;;
+  esac
+fi
+
+wlab_ok "фильтр: $DESC"
+
+# --- новая сессия -----------------------------------------------------------
+JSONL_FILE="$WLAB_STATE/ble.jsonl"
+if [[ -s "$JSONL_FILE" ]]; then
+  mv "$JSONL_FILE" "$WLAB_STATE/ble_$(date +%Y%m%d_%H%M%S).jsonl"
+fi
+: >> "$JSONL_FILE" 2>/dev/null || true
+
+cleanup() {
+  pkill -P $$ 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'cleanup; exit 0' INT TERM
+
+printf '\033[H\033[2J'
+printf '%s  WLAB BLE  %s  фильтр: %s\n' "$C_CYN" "$IFC" "$DESC"
+printf '%s  Ctrl+C — стоп, потом wlab pak <номер>%s\n\n' "$C_DIM" "$C_R"
+
+printf '%s' "$C_DIM"
+cat <<'LEGEND'
+  #     номер пакета (его скармливаешь в: wlab pak N)
+  TIME  секунды от начала захвата
+  SRC   кто отправил · DST кому (BCAST = всем сразу)
+  RSSI  сила сигнала в dBm: -40 рядом, -90 далеко, ? = нет данных
+  NAME  имя из рекламы, - = устройство его не передаёт
+
+  ADV_IND     реклама, к устройству можно подключиться (телефон, часы, колонка)
+  ADV_NONCONN реклама без подключения (датчики, маячки, IoT — Xiaomi, Midea)
+  SCAN_REQ    устройство ищет, что вокруг (телефон сканирует)
+  SCAN_RSP    ответ на SCAN_REQ (в нём часто и лежит имя)
+  CONNECT     установка соединения — вот тут самое интересное
+LEGEND
+printf '%s\n\n' "$C_R"
+
+printf '%-6s %-12s %-17s %-17s %-12s %5s %s\n' "#" "TIME" "SRC" "DST" "TYPE" "RSSI" "NAME"
+printf '%s\n' "--------------------------------------------------------------------------------------------"
+
+count=0
+getf() {
+  local idx="${POS[$1]:-}"
+  [[ -z "$idx" ]] && return 0
+  printf '%s' "${vals[$idx]:-}"
+}
+
+TSHARK_CMD=(tshark -i "$IFC" -Y "$DFILTER" -l -T fields "${E_ARGS[@]}" -E separator=/t -E occurrence=f)
+if [[ "$DURATION" -gt 0 ]]; then
+  TSHARK_CMD=(timeout --signal=INT "$DURATION" "${TSHARK_CMD[@]}")
+fi
+
+TSHARK_LOG="$WLAB_STATE/ble/tshark.log"
+: > "$TSHARK_LOG" 2>/dev/null || true
+BEFORE_LINES=$(wc -l < "$JSONL_FILE" 2>/dev/null || echo 0)
+
+"${TSHARK_CMD[@]}" 2>>"$TSHARK_LOG" | while IFS=$'\t' read -r -a vals; do
+  (( ${#vals[@]} == 0 )) && continue
+
+  frame=$(getf frame.number)
+  t=$(getf frame.time_relative)
+  pdu=$(getf btle.advertising_header.pdu_type)
+  adv=$(getf btle.advertising_address)
+  init=$(getf btle.initiator_address)
+  scan=$(getf btle.scanning_address)
+  ad=$(getf btle.advertising_data)
+  name=$(getf btcommon.eir_ad.entry.device_name)
+  mfr=$(getf btcommon.eir_ad.entry.manufacturer_data)
+  rssi=$(getf nordic_ble.rssi)
+  [[ -z "$rssi" ]] && rssi=$(getf btle.rssi)
+
+  frame=${frame//\"/}; t=${t//\"/}; pdu=${pdu//\"/}
+  adv=${adv//\"/}; init=${init//\"/}; scan=${scan//\"/}
+  name=${name//\"/}; rssi=${rssi//\"/}
+
+  [[ -z "$frame" ]] && continue
+  [[ -z "$t" ]] && t="0.000"
+  t=${t:0:8}
+  [[ -z "$name" ]] && name="-"
+  [[ -z "$rssi" ]] && rssi="?"
+
+  case "$pdu" in
+    0x00) type="ADV_IND";     src=$adv; dst="BCAST" ;;
+    0x01) type="ADV_DIRECT";  src=$adv; dst=${init:-BCAST} ;;
+    0x02) type="ADV_NONCONN"; src=$adv; dst="BCAST" ;;
+    0x03) type="SCAN_REQ";    src=$scan; dst=$adv ;;
+    0x04) type="SCAN_RSP";    src=$adv; dst="BCAST" ;;
+    0x05) type="CONNECT";     src=$init; dst=$adv ;;
+    0x06) type="ADV_SCAN";    src=$adv; dst="BCAST" ;;
+    *)    type="PDU_${pdu:-?}"; src=$adv; dst="?" ;;
+  esac
+  [[ -z "$src" ]] && src="?"
+  [[ -z "$dst" ]] && dst="?"
+
+  printf '%-6s %-12s %-17.17s %-17.17s %-12.12s %5s %s\n' \
+    "$frame" "$t" "$src" "$dst" "$type" "$rssi" "$name"
+
+  wlab_log ble packet "frame=$frame" "t=$t" "pdu=$type" "src=$src" "dst=$dst" \
+                       "rssi=$rssi" "name=$name" "mfr=$mfr" "ad=$ad"
+done || true
+
+echo
+wlab_ok "сессия: $JSONL_FILE"
+
+AFTER_LINES=$(wc -l < "$JSONL_FILE" 2>/dev/null || echo 0)
+if [[ "$AFTER_LINES" -le "$BEFORE_LINES" ]]; then
+  wlab_err "tshark не выдал ни одного пакета"
+  if [[ -s "$TSHARK_LOG" ]]; then
+    wlab_info "ошибки tshark:"
+    tail -n 10 "$TSHARK_LOG" | sed 's/^/    /'
+  fi
+  wlab_info "проверь: tshark -D | grep -i nrf   и   прошивку донгла в nRF Connect"
+fi
+
+wlab_info "разбор пакета: wlab pak <номер>"

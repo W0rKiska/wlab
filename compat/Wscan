@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# v9-совместимость: Wscan [канал]
+set -euo pipefail
+WLAB_BIN=/usr/bin/wlab
+[[ -x "$WLAB_BIN" ]] || WLAB_BIN=/usr/local/bin/wlab
+
+if [[ -n "${1:-}" ]]; then
+  exec "$WLAB_BIN" scan -c "$1"
+fi
+exec "$WLAB_BIN" scan

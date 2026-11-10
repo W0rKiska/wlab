@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# v9-совместимость: stop — погасить всё
+set -euo pipefail
+WLAB_BIN=/usr/bin/wlab
+[[ -x "$WLAB_BIN" ]] || WLAB_BIN=/usr/local/bin/wlab
+exec "$WLAB_BIN" stop "$@"

@@ -1,0 +1,10 @@
+# nRF52840 dongle (Nordic Semiconductor) -> стабильное имя /dev/nrf52
+# Проблема: /dev/ttyACM0 превращается в ttyACM1 после переподключения.
+# Решение: симлинк по VID/PID, а не по номеру.
+#
+# Проверить свой VID/PID:   lsusb | grep -i nordic
+# 1915 — Nordic Semiconductor (PCA10059 dongle, nRF Sniffer)
+# 1366 — SEGGER (dev kit через J-Link)
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1915", SYMLINK+="nrf52", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1366", SYMLINK+="nrf52", MODE="0666", GROUP="plugdev"

@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  wlab scan — live-скан эфира
+#  wlab scan            все каналы
+#  wlab scan -c 6       фиксироваться на канале 6
+#  wlab scan -1          один снимок и выйти (удобно для скриптов)
+# ============================================================================
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+export WLAB_ROOT="${WLAB_ROOT:-$(dirname "$(dirname "$SELF")")}"
+# shellcheck source=/dev/null
+source "$WLAB_ROOT/lib/wlab_lib.sh"
+wlab_load_conf
+wlab_need_root "$SELF" "$@"
+wlab_dirs
+
+CHANNEL=""
+ONCE=0
+LIMIT="${SCAN_LIMIT:-15}"
+IFC="${IFACE_SCAN:-$IFACE_MON}"
+KILL=0
+
+usage() {
+  cat <<EOF
+Использование: wlab scan [опции]
+
+  -c, --channel N   фиксировать канал (иначе хоп по всем)
+  -1, --once        один снимок и выход
+  -n, --limit N     сколько строк показывать (по умолчанию $LIMIT)
+  -i, --iface IF    адаптер (по умолчанию $IFC)
+      --kill        прибить мешающие процессы (airmon-ng check kill)
+  -h, --help        эта справка
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--channel) CHANNEL="${2:?нет значения для $1}"; shift 2 ;;
+    -1|--once)    ONCE=1; shift ;;
+    -n|--limit)   LIMIT="${2:?нет значения для $1}"; shift 2 ;;
+    -i|--iface)   IFC="${2:?нет значения для $1}"; shift 2 ;;
+    --kill)       KILL=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    -*)           wlab_die "неизвестная опция: $1" ;;
+    *)            CHANNEL="$1"; shift ;;
+  esac
+done
+
+wlab_uint "$LIMIT" || wlab_die "limit должен быть числом"
+wlab_require_cmds airodump-ng iw ip awk sort || exit 1
+
+if [[ -n "$CHANNEL" ]]; then
+  wlab_uint "$CHANNEL" || wlab_die "канал должен быть числом, а не '$CHANNEL'"
+fi
+
+AD_PID=""
+CLEANED=0
+CSV="$WLAB_STATE/scan/live-01.csv"
+
+cleanup() {
+  [[ $CLEANED -eq 1 ]] && return 0
+  CLEANED=1
+  if [[ -n "$AD_PID" ]]; then
+    kill "$AD_PID" 2>/dev/null || true
+    wait "$AD_PID" 2>/dev/null || true
+  fi
+  rm -f "$WLAB_RUN/scan.pid"
+  wlab_mon_off "$IFC"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 0' INT TERM
+
+[[ $KILL -eq 1 ]] && { wlab_warn "airmon-ng check kill — NetworkManager будет остановлен"; airmon-ng check kill >/dev/null 2>&1 || true; }
+
+wlab_mon_on "$IFC"
+if [[ -n "$CHANNEL" ]]; then
+  wlab_set_channel "$IFC" "$CHANNEL"
+  wlab_ok "$IFC в monitor, канал $CHANNEL"
+else
+  wlab_ok "$IFC в monitor, хоп по всем каналам"
+fi
+
+rm -f "$WLAB_STATE/scan/live-"*.csv "$WLAB_STATE/scan/live-"*.cap \
+      "$WLAB_STATE/scan/live-"*.kismet* 2>/dev/null || true
+
+AD_ARGS=(-w "$WLAB_STATE/scan/live" --output-format csv --write-interval 1)
+if [[ -n "$CHANNEL" ]]; then
+  AD_ARGS+=(-c "$CHANNEL")
+fi
+AD_LOG="$WLAB_STATE/scan/airodump.log"
+: > "$AD_LOG" 2>/dev/null || true
+airodump-ng "${AD_ARGS[@]}" "$IFC" >> "$AD_LOG" 2>&1 &
+AD_PID=$!
+printf '%s' "$AD_PID" > "$WLAB_RUN/scan.pid"
+wlab_log scan start "iface=$IFC" "channel=${CHANNEL:-hop}"
+
+sleep 3
+
+print_networks() {
+  [[ -r "$CSV" ]] || return 0
+  awk -F',' -v lim="$LIMIT" '
+    /^BSSID/       { net=1; sta=0; next }
+    /^Station MAC/ { net=0; sta=1; next }
+    net && $1 ~ /^[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:/ {
+      mac=$1; ch=$4; pwr=$9; essid=$14
+      gsub(/^[ \t]+|[ \t]+$/,"",mac)
+      gsub(/^[ \t]+|[ \t]+$/,"",ch)
+      gsub(/^[ \t]+|[ \t]+$/,"",pwr)
+      gsub(/^[ \t]+|[ \t]+$/,"",essid)
+      if (essid == "") essid = "<hidden>"
+      if (pwr !~ /^-?[0-9]+$/) next
+      printf "%d|%s|%s|%s\n", pwr, mac, ch, essid
+    }' "$CSV" | sort -t'|' -k1,1 -nr | head -n "$LIMIT" |
+  awk -F'|' '{ printf "  %-17s  ch %-3s  %4s dBm  %s\n", $2, $3, $1, $4 }' || true
+}
+
+print_stations() {
+  [[ -r "$CSV" ]] || return 0
+  awk -F',' -v lim="$LIMIT" '
+    /^Station MAC/ { sta=1; next }
+    sta && $1 ~ /^[0-9A-Fa-f][0-9A-Fa-f]:/ {
+      mac=$1; pwr=$4; bssid=$6
+      gsub(/^[ \t]+|[ \t]+$/,"",mac)
+      gsub(/^[ \t]+|[ \t]+$/,"",pwr)
+      gsub(/^[ \t]+|[ \t]+$/,"",bssid)
+      if (bssid == "not associated" || bssid == "") bssid = "-"
+      if (pwr !~ /^-?[0-9]+$/) next
+      printf "%d|%s|%s\n", pwr, mac, bssid
+    }' "$CSV" | sort -t'|' -k1,1 -nr | head -n "$LIMIT" |
+  awk -F'|' '{ printf "  %-17s  %4s dBm  -> %s\n", $2, $1, $3 }' || true
+}
+
+if [[ $ONCE -eq 1 ]]; then
+  sleep 5
+  echo
+  echo "${C_CYN}=== СЕТИ ===${C_R}"
+  print_networks
+  echo
+  echo "${C_CYN}=== КЛИЕНТЫ ===${C_R}"
+  print_stations
+  exit 0
+fi
+
+while true; do
+  if ! kill -0 "$AD_PID" 2>/dev/null; then
+    wlab_err "airodump-ng умер. Последние строки лога:"
+    tail -n 10 "$AD_LOG" 2>/dev/null | sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' || true
+    wlab_info "полный лог: $AD_LOG"
+    exit 1
+  fi
+
+  printf '\033[H\033[2J'
+  printf '%s  WLAB SCAN  %s  канал: %s\n' "$C_CYN" "$IFC" "${CHANNEL:-hop}"
+  printf '%s  ch = канал · dBm = сигнал (ближе к 0 — сильнее) · Ctrl+C — стоп%s\n\n' "$C_DIM" "$C_R"
+  printf '%sСЕТИ:%s\n' "$C_GRN" "$C_R"
+  print_networks
+  printf '\n%sКЛИЕНТЫ:%s\n' "$C_GRN" "$C_R"
+  print_stations
+  sleep 2
+done

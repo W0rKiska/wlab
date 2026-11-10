@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  wlab stop — погасить только СВОИ процессы, вернуть адаптеры и сеть.
+#  wlab stop           обычная уборка
+#  wlab stop --purge   ещё и логи сессии снести
+# ============================================================================
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+export WLAB_ROOT="${WLAB_ROOT:-$(dirname "$(dirname "$SELF")")}"
+# shellcheck source=/dev/null
+source "$WLAB_ROOT/lib/wlab_lib.sh"
+wlab_load_conf
+wlab_need_root "$SELF" "$@"
+wlab_dirs
+
+PURGE=0
+for a in "$@"; do
+  case "$a" in
+    --purge) PURGE=1 ;;
+    -h|--help) echo "Использование: wlab stop [--purge]"; exit 0 ;;
+    *) wlab_die "неизвестная опция: $a" ;;
+  esac
+done
+
+wlab_banner "WLAB :: остановка"
+
+# --- 1. процессы, которые мы сами записали --------------------------------
+for n in ap portal scan deauth ble pmkid; do
+  f=$(wlab_pidfile "$n")
+  if [[ -f "$f" ]]; then
+    pid=$(cat "$f" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wlab_ok "остановлен $n (pid $pid)"
+    fi
+    rm -f "$f"
+  fi
+done
+
+# --- 2. hostapd/dnsmasq ТОЛЬКО с нашими конфигами -------------------------
+# не трогаем системный dnsmasq и чужие hostapd
+for pat in "$WLAB_RUN/hostapd.conf" "$WLAB_RUN/dnsmasq.conf"; do
+  pkill -f "$pat" 2>/dev/null || true
+done
+
+# --- 3. iptables: только наши цепочки -------------------------------------
+iptables -t nat -D POSTROUTING -j WLAB_NAT 2>/dev/null || true
+iptables -D FORWARD -j WLAB_FWD 2>/dev/null || true
+iptables -t nat -F WLAB_NAT 2>/dev/null || true
+iptables -t nat -X WLAB_NAT 2>/dev/null || true
+iptables -F WLAB_FWD 2>/dev/null || true
+iptables -X WLAB_FWD 2>/dev/null || true
+
+# --- 4. вернуть ip_forward ------------------------------------------------
+if [[ -f "$WLAB_RUN/ip_forward.orig" ]]; then
+  orig=$(cat "$WLAB_RUN/ip_forward.orig" 2>/dev/null || echo 0)
+  sysctl -qw "net.ipv4.ip_forward=${orig}" 2>/dev/null || true
+  rm -f "$WLAB_RUN/ip_forward.orig"
+fi
+
+# --- 5. адаптеры в нормальный режим --------------------------------------
+for i in "$IFACE_MON" "$IFACE_AP"; do
+  if wlab_iface_exists "$i"; then
+    ip link set "$i" down 2>/dev/null || true
+    iw dev "$i" set type managed 2>/dev/null || true
+    ip link set "$i" up 2>/dev/null || true
+    wlab_ok "$i -> managed"
+  fi
+done
+
+# --- 6. временные конфиги -------------------------------------------------
+rm -f "$WLAB_RUN/hostapd.conf" "$WLAB_RUN/dnsmasq.conf" "$WLAB_RUN/hostapd.eap_user" 2>/dev/null || true
+
+# --- 7. сеть обратно ------------------------------------------------------
+wlab_restore_nm
+wlab_ok "NetworkManager поднят"
+
+# --- 8. по желанию — логи -------------------------------------------------
+if [[ $PURGE -eq 1 ]]; then
+  rm -rf "$WLAB_STATE/ap" "$WLAB_STATE/scan" "$WLAB_STATE/ble" "$WLAB_STATE/osint" "$WLAB_STATE/caps" 2>/dev/null || true
+  rm -f "$WLAB_STATE"/*.jsonl 2>/dev/null || true
+  wlab_ok "логи сессии удалены"
+fi
+
+wlab_ok "всё остановлено"

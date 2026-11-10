@@ -1,0 +1,19 @@
+# Все текстовые файлы — LF. Иначе на Windows git запишет CRLF
+# и bash умрёт с "bad interpreter: /usr/bin/env bash^M".
+* text=auto eol=lf
+
+*.sh     text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+*.conf   text eol=lf
+*.rules  text eol=lf
+wlab     text eol=lf
+bin/*    text eol=lf
+
+# бинарники — НЕ трогать нормализацией
+*.png    binary
+*.jpg    binary
+*.pcap   binary
+*.pcapng binary
+*.cap    binary
+*.hc22000 binary

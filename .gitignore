@@ -1,0 +1,25 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+
+# результаты работы
+*.pcap
+*.pcapng
+*.cap
+*.hc22000
+*.22000
+*.jsonl
+*.log
+
+# osint-отчёты
+osint/
+scan/
+caps/
+
+# локальное
+.env
+*.local
+.idea/
+.vscode/
+.DS_Store

